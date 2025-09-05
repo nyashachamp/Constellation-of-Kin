@@ -1,30 +1,109 @@
-# Constellation of Kin — Blender Python Script
-# Works in Blender 3.x with Eevee renderer
-# 1) Put your JSON on disk, update JSON_PATH
-# 2) Run this script from the Scripting workspace
-# 3) Render > Render Animation
+# Constellation of Kin — Blender Script with Embedded JSON (Blender 3.x & 4.x safe)
 
 import bpy, json, math, mathutils, os
 
-# ========= USER SETTINGS =========
-JSON_PATH = r"/absolute/path/to/constellation.json"  # <-- change this
+# ========= TIMING / VISUAL SETTINGS =========
 FPS = 30
-SCENE_DURATION_SECONDS = 20  # enough to cover your timeline 't' values
-STAR_SIZE = 0.1               # base size (scale up/down)
+SCENE_DURATION_SECONDS = 14      # adjust if you add more timeline events
+STAR_SIZE = 0.11                 # base size of stars
 GLOW_STRENGTH = 2.0
 EDGE_WIDTH = 0.01
-LAYOUT_RADIUS = 5.0           # if no pos provided, radial layout
+LAYOUT_RADIUS = 5.0              # used if no fixed pos provided
+
+# ========= YOUR EMBEDDED JSON (Dixon/Kennedy line) =========
+json_text = r"""
+{
+  "people": [
+    { "id":"p1","name":"Hugh Johnson Kennedy","glow":"blue-green","side":"paternal" },
+    { "id":"p2","name":"Mildred Wagstaff Hutchinson","glow":"white-gold","side":"maternal" },
+    { "id":"p3","name":"Johnson John Kennedy","glow":"emerald","side":"paternal" },
+    { "id":"p4","name":"Mom Dixon","glow":"earth","side":"maternal" },
+    { "id":"p5","name":"Gilbert Dixon","glow":"gold","side":"paternal" },
+    { "id":"p6","name":"Venus Penny Dixon","glow":"bronze","side":"maternal" },
+    { "id":"p7","name":"James Dixon","glow":"crimson","side":"paternal" },
+    { "id":"p8","name":"Lavinia Dinkins","glow":"green","side":"maternal" },
+    { "id":"p9","name":"Eugene Dixon","glow":"bronze-gold","side":"paternal" },
+    { "id":"p10","name":"Marie Dixon","glow":"pale_blue","side":"maternal" },
+    { "id":"p11","name":"Carl Dixon, Sr.","glow":"white-gold","side":"paternal" },
+    { "id":"p12","name":"Cecelia Webb","glow":"lavender","side":"maternal" },
+    { "id":"p13","name":"Carl Dixon","glow":"teal","side":"paternal" }
+  ],
+  "relationships": [
+    { "parent_id":"p1","child_id":"p3" },
+    { "parent_id":"p2","child_id":"p3" },
+    { "parent_id":"p3","child_id":"p5" },
+    { "parent_id":"p4","child_id":"p5" },
+    { "parent_id":"p5","child_id":"p7" },
+    { "parent_id":"p6","child_id":"p7" },
+    { "parent_id":"p7","child_id":"p9" },
+    { "parent_id":"p8","child_id":"p9" },
+    { "parent_id":"p9","child_id":"p11" },
+    { "parent_id":"p10","child_id":"p11" },
+    { "parent_id":"p11","child_id":"p13" },
+    { "parent_id":"p12","child_id":"p13" }
+  ],
+  "timeline": [
+    { "t":0.0,"action":"focus_node","id":"p1","zoom":1.4 },
+    { "t":0.4,"action":"reveal_node","id":"p1" },
+    { "t":0.9,"action":"reveal_node","id":"p2" },
+    { "t":1.6,"action":"draw_edge","from":"p1","to":"p3" },
+    { "t":1.6,"action":"draw_edge","from":"p2","to":"p3" },
+    { "t":2.0,"action":"focus_node","id":"p3","zoom":1.5 },
+    { "t":2.4,"action":"reveal_node","id":"p3" },
+    { "t":3.2,"action":"draw_edge","from":"p3","to":"p5" },
+    { "t":3.2,"action":"draw_edge","from":"p4","to":"p5" },
+    { "t":3.3,"action":"reveal_node","id":"p4" },
+    { "t":3.8,"action":"focus_node","id":"p5" },
+    { "t":4.1,"action":"reveal_node","id":"p5" },
+    { "t":5.0,"action":"draw_edge","from":"p5","to":"p7" },
+    { "t":5.0,"action":"draw_edge","from":"p6","to":"p7" },
+    { "t":5.1,"action":"reveal_node","id":"p6" },
+    { "t":5.7,"action":"focus_node","id":"p7" },
+    { "t":6.0,"action":"reveal_node","id":"p7" },
+    { "t":6.9,"action":"draw_edge","from":"p7","to":"p9" },
+    { "t":6.9,"action":"draw_edge","from":"p8","to":"p9" },
+    { "t":7.0,"action":"reveal_node","id":"p8" },
+    { "t":7.6,"action":"focus_node","id":"p9" },
+    { "t":7.9,"action":"reveal_node","id":"p9" },
+    { "t":8.8,"action":"draw_edge","from":"p9","to":"p11" },
+    { "t":8.8,"action":"draw_edge","from":"p10","to":"p11" },
+    { "t":8.9,"action":"reveal_node","id":"p10" },
+    { "t":9.5,"action":"focus_node","id":"p11" },
+    { "t":9.8,"action":"reveal_node","id":"p11" },
+    { "t":10.7,"action":"draw_edge","from":"p11","to":"p13" },
+    { "t":10.7,"action":"draw_edge","from":"p12","to":"p13" },
+    { "t":10.8,"action":"reveal_node","id":"p12" },
+    { "t":11.4,"action":"focus_node","id":"p13","zoom":1.6 },
+    { "t":11.7,"action":"reveal_node","id":"p13" },
+    { "t":12.5,"action":"zoom_out","to":"constellation_view","zoom":0.85 }
+  ]
+}
+"""
 
 # ========= HELPERS =========
 def sec_to_frame(t): return int(round(t * FPS))
 
 def ensure_eevee_with_bloom():
     scene = bpy.context.scene
-    scene.render.engine = 'BLENDER_EEVEE'
-    scene.eevee.use_bloom = True
-    scene.eevee.bloom_intensity = 0.12
-    scene.eevee.bloom_threshold = 0.8
-    scene.eevee.use_soft_shadows = True
+    # Blender 3.x vs 4.x engine name change
+    engines = tuple(bpy.types.RenderSettings.bl_rna.properties['engine'].enum_items.keys())
+    if 'BLENDER_EEVEE' in engines:
+        scene.render.engine = 'BLENDER_EEVEE'
+    elif 'BLENDER_EEVEE_NEXT' in engines:
+        scene.render.engine = 'BLENDER_EEVEE_NEXT'
+    else:
+        scene.render.engine = 'CYCLES'  # fallback
+
+    # Enable bloom if Eevee
+    try:
+        eevee = scene.eevee
+        eevee.use_bloom = True
+        eevee.bloom_intensity = 0.12
+        eevee.bloom_threshold = 0.8
+        eevee.use_soft_shadows = True
+    except:
+        pass
+
     scene.render.fps = FPS
 
 def new_collection(name):
@@ -38,7 +117,7 @@ def get_or_create_emission_material(name, color):
     mat = bpy.data.materials.new(name)
     mat.use_nodes = True
     nt = mat.node_tree
-    for n in nt.nodes: nt.nodes.remove(n)
+    for n in list(nt.nodes): nt.nodes.remove(n)
     out = nt.nodes.new("ShaderNodeOutputMaterial")
     emit = nt.nodes.new("ShaderNodeEmission")
     emit.inputs["Color"].default_value = (color[0], color[1], color[2], 1)
@@ -48,7 +127,6 @@ def get_or_create_emission_material(name, color):
     return mat
 
 def color_from_glow(glow):
-    # Map your glow names to RGB (0..1). Adjust to taste.
     table = {
         "blue-green": (0.42, 0.82, 1.00),
         "white-gold": (1.00, 0.91, 0.70),
@@ -65,70 +143,52 @@ def color_from_glow(glow):
     return table.get(glow, (0.81, 0.88, 1.00))
 
 def shape_mesh(side):
-    # diamond for paternal, circle (disc) for maternal
-    # We’ll use a flat disc and rotate a square for diamond
     if side == "paternal":
         bpy.ops.mesh.primitive_plane_add(size=STAR_SIZE)
         obj = bpy.context.active_object
-        obj.rotation_euler.z = math.radians(45)  # diamond
+        obj.rotation_euler.z = math.radians(45)
         return obj
     else:
         bpy.ops.mesh.primitive_circle_add(vertices=24, radius=STAR_SIZE*0.8, fill_type='NGON')
         return bpy.context.active_object
 
 def place_star(person, angle_idx, total):
-    # If pos is provided (x,y), use it. Else, put on a circle.
-    pos = person.get("pos", None)
-    if pos and isinstance(pos.get("x"), (int,float)) and isinstance(pos.get("y"), (int,float)):
-        x, y = pos["x"], pos["y"]
-    else:
-        angle = 2*math.pi * (angle_idx / max(total, 1))
-        x = math.cos(angle) * LAYOUT_RADIUS
-        y = math.sin(angle) * LAYOUT_RADIUS
+    angle = 2*math.pi * (angle_idx / max(total, 1))
+    x = math.cos(angle) * LAYOUT_RADIUS
+    y = math.sin(angle) * LAYOUT_RADIUS
     obj = shape_mesh(person.get("side","maternal"))
     obj.name = f"STAR_{person['id']}"
     obj.location = (x, y, 0.0)
-    # material
     col = color_from_glow(person.get("glow",""))
     mat = get_or_create_emission_material(f"EMIT_{person['glow']}", col)
-    if obj.data.materials:
-        obj.data.materials[0] = mat
-    else:
-        obj.data.materials.append(mat)
-    obj.hide_render = True  # start hidden until reveal
+    if obj.data.materials: obj.data.materials[0] = mat
+    else: obj.data.materials.append(mat)
+    obj.hide_render = True
     return obj
 
 def bezier_curve_between(a_loc, b_loc):
-    # simple arc using a midpoint lifted in Z
     p0 = mathutils.Vector(a_loc)
     p1 = mathutils.Vector(b_loc)
     mid = (p0 + p1) / 2
-    ctrl = mathutils.Vector((mid.x, mid.y, 1.2))  # lift for arc
+    ctrl = mathutils.Vector((mid.x, mid.y, 1.2))
     curve_data = bpy.data.curves.new('edgeCurve', type='CURVE')
     curve_data.dimensions = '3D'
     spline = curve_data.splines.new('BEZIER')
     spline.bezier_points.add(2)
     pts = spline.bezier_points
-    pts[0].co = p0; pts[0].handle_left = p0; pts[0].handle_right = ctrl
-    pts[1].co = ctrl; pts[1].handle_left = ctrl; pts[1].handle_right = ctrl
-    pts[2].co = p1; pts[2].handle_left = ctrl; pts[2].handle_right = p1
+    pts[0].co = p0; pts[1].co = ctrl; pts[2].co = p1
     curve_obj = bpy.data.objects.new('EDGE', curve_data)
     bpy.context.scene.collection.objects.link(curve_obj)
-    # thickness via bevel
     curve_data.bevel_depth = EDGE_WIDTH
     return curve_obj
 
 def set_visibility_keyframes(obj, frame_on):
-    # hidden before, visible after frame_on
     obj.hide_render = True
     obj.keyframe_insert(data_path="hide_render", frame=frame_on-1)
     obj.hide_render = False
     obj.keyframe_insert(data_path="hide_render", frame=frame_on)
 
 def animate_camera_focus(cam_obj, target_loc, frame, zoom=1.4):
-    # Damp track to empty target; animate location and FOV
-    scene = bpy.context.scene
-    # create/ensure target empty
     tgt_name = "CamTarget"
     tgt = bpy.data.objects.get(tgt_name)
     if not tgt:
@@ -137,134 +197,95 @@ def animate_camera_focus(cam_obj, target_loc, frame, zoom=1.4):
     tgt.location = target_loc
     tgt.keyframe_insert(data_path="location", frame=frame)
 
-    # add track constraint once
     if not any(c.type == 'TRACK_TO' for c in cam_obj.constraints):
         con = cam_obj.constraints.new(type='TRACK_TO')
         con.target = tgt
         con.track_axis = 'TRACK_NEGATIVE_Z'
         con.up_axis = 'UP_Y'
 
-    # animate camera distance (move on -Z) and lens as "zoom"
     cam_obj.location = (target_loc[0], target_loc[1]-3.0/zoom, 2.5/zoom)
     cam_obj.keyframe_insert(data_path="location", frame=frame)
     cam = cam_obj.data
     cam.lens = 50/zoom
     cam.keyframe_insert(data_path="lens", frame=frame)
 
-# ========= MAIN =========
-# Clean default scene
+# ========= SCENE SETUP =========
 bpy.ops.object.select_all(action='SELECT')
 bpy.ops.object.delete(use_global=False)
 ensure_eevee_with_bloom()
 
-# Camera & light
 bpy.ops.object.camera_add(location=(0, -7, 3), rotation=(math.radians(75), 0, 0))
 cam = bpy.context.active_object
 bpy.context.scene.camera = cam
 bpy.ops.object.light_add(type='AREA', location=(0,0,5))
 bpy.context.active_object.data.energy = 200
 
-# Background (world color)
 world = bpy.context.scene.world
 world.use_nodes = True
 bg = world.node_tree.nodes['Background']
-bg.inputs[0].default_value = (0.03, 0.05, 0.12, 1)  # deep navy
+bg.inputs[0].default_value = (0.03, 0.05, 0.12, 1)
 
-# Collections
 col_stars = new_collection("Stars")
 col_edges = new_collection("Edges")
 
-# Load JSON
-with open(JSON_PATH, "r", encoding="utf-8") as f:
-    data = json.load(f)
-
+data = json.loads(json_text)
 people = data["people"]
 rels = data.get("relationships", [])
 timeline = data.get("timeline", [])
 
-# Index people
-people_by_id = {p["id"]: p for p in people}
-
-# Create stars
 stars = {}
 for idx, p in enumerate(people):
     star = place_star(p, idx, len(people))
-    # move to Stars collection
     for coll in star.users_collection:
         coll.objects.unlink(star)
     col_stars.objects.link(star)
     stars[p["id"]] = star
 
-# Pre-create edges (hidden), one per relationship
-edge_objs = []
 for r in rels:
     a = stars.get(r["parent_id"])
     b = stars.get(r["child_id"])
     if not (a and b): continue
     curve = bezier_curve_between(a.location, b.location)
-    # color curve using emission material
-    col = (0.64, 0.71, 1.0)  # soft blue
-    mat = get_or_create_emission_material("EMIT_EDGE", col)
-    if len(curve.data.materials):
-        curve.data.materials[0] = mat
-    else:
-        curve.data.materials.append(mat)
+    mat = get_or_create_emission_material("EMIT_EDGE", (0.64, 0.71, 1.0))
+    if len(curve.data.materials): curve.data.materials[0] = mat
+    else: curve.data.materials.append(mat)
     curve.hide_render = True
-    # move to Edges collection
     for coll in curve.users_collection:
         coll.objects.unlink(curve)
     col_edges.objects.link(curve)
-    # store mapping
     curve.name = f"EDGE_{r['parent_id']}_{r['child_id']}"
-    edge_objs.append((r, curve))
 
-# Animate by timeline
 for evt in timeline:
-    t = evt.get("t", 0.0)
+    t = float(evt.get("t", 0.0))
     frame = sec_to_frame(t)
     action = evt.get("action")
 
     if action == "reveal_node":
-        pid = evt["id"]
-        obj = stars.get(pid)
-        if obj:
-            set_visibility_keyframes(obj, frame)
+        obj = stars.get(evt["id"])
+        if obj: set_visibility_keyframes(obj, frame)
 
     elif action == "draw_edge":
-        a, b = evt["from"], evt["to"]
-        name = f"EDGE_{a}_{b}"
-        obj = bpy.data.objects.get(name)
-        if obj:
-            set_visibility_keyframes(obj, frame)
+        obj = bpy.data.objects.get(f"EDGE_{evt['from']}_{evt['to']}")
+        if obj: set_visibility_keyframes(obj, frame)
 
     elif action == "focus_node":
-        pid = evt["id"]
-        zoom = evt.get("zoom", 1.4)
-        obj = stars.get(pid)
-        if obj:
-            animate_camera_focus(cam, obj.location, frame, zoom)
+        obj = stars.get(evt["id"])
+        if obj: animate_camera_focus(cam, obj.location, frame, evt.get("zoom",1.4))
 
     elif action == "zoom_out":
-        # pull the camera back to show everything
-        animate_camera_focus(cam, mathutils.Vector((0,0,0)), frame, evt.get("zoom", 0.9))
+        animate_camera_focus(cam, mathutils.Vector((0,0,0)), frame, evt.get("zoom",0.9))
 
-# Scene range & output
 scene = bpy.context.scene
 scene.frame_start = 0
 scene.frame_end = sec_to_frame(SCENE_DURATION_SECONDS)
 scene.render.resolution_x = 1920
 scene.render.resolution_y = 1080
-scene.render.film_transparent = False
 
-# Output path (change if desired)
 out_dir = bpy.path.abspath("//renders")
 os.makedirs(out_dir, exist_ok=True)
 scene.render.filepath = os.path.join(out_dir, "constellation_")
 scene.render.image_settings.file_format = 'FFMPEG'
 scene.render.ffmpeg.format = 'MPEG4'
 scene.render.ffmpeg.codec = 'H264'
-scene.render.ffmpeg.constant_rate_factor = 'MEDIUM'
-scene.render.ffmpeg.max_b_frames = 2
-scene.render.ffmpeg.gopsize = 12
 
-print("Setup complete. Use Render > Render Animation to export video.")
+print("✅ Setup complete. Go to Render → Render Animation to export video.")
