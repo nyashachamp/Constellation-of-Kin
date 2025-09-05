@@ -1,0 +1,270 @@
+# Constellation of Kin — Blender Python Script
+# Works in Blender 3.x with Eevee renderer
+# 1) Put your JSON on disk, update JSON_PATH
+# 2) Run this script from the Scripting workspace
+# 3) Render > Render Animation
+
+import bpy, json, math, mathutils, os
+
+# ========= USER SETTINGS =========
+JSON_PATH = r"/absolute/path/to/constellation.json"  # <-- change this
+FPS = 30
+SCENE_DURATION_SECONDS = 20  # enough to cover your timeline 't' values
+STAR_SIZE = 0.1               # base size (scale up/down)
+GLOW_STRENGTH = 2.0
+EDGE_WIDTH = 0.01
+LAYOUT_RADIUS = 5.0           # if no pos provided, radial layout
+
+# ========= HELPERS =========
+def sec_to_frame(t): return int(round(t * FPS))
+
+def ensure_eevee_with_bloom():
+    scene = bpy.context.scene
+    scene.render.engine = 'BLENDER_EEVEE'
+    scene.eevee.use_bloom = True
+    scene.eevee.bloom_intensity = 0.12
+    scene.eevee.bloom_threshold = 0.8
+    scene.eevee.use_soft_shadows = True
+    scene.render.fps = FPS
+
+def new_collection(name):
+    c = bpy.data.collections.new(name)
+    bpy.context.scene.collection.children.link(c)
+    return c
+
+def get_or_create_emission_material(name, color):
+    mat = bpy.data.materials.get(name)
+    if mat: return mat
+    mat = bpy.data.materials.new(name)
+    mat.use_nodes = True
+    nt = mat.node_tree
+    for n in nt.nodes: nt.nodes.remove(n)
+    out = nt.nodes.new("ShaderNodeOutputMaterial")
+    emit = nt.nodes.new("ShaderNodeEmission")
+    emit.inputs["Color"].default_value = (color[0], color[1], color[2], 1)
+    emit.inputs["Strength"].default_value = GLOW_STRENGTH
+    nt.links.new(emit.outputs["Emission"], out.inputs["Surface"])
+    mat.blend_method = 'BLEND'
+    return mat
+
+def color_from_glow(glow):
+    # Map your glow names to RGB (0..1). Adjust to taste.
+    table = {
+        "blue-green": (0.42, 0.82, 1.00),
+        "white-gold": (1.00, 0.91, 0.70),
+        "emerald":    (0.40, 0.90, 0.66),
+        "gold":       (1.00, 0.83, 0.42),
+        "bronze":     (0.85, 0.63, 0.36),
+        "bronze-gold":(0.90, 0.73, 0.43),
+        "crimson":    (1.00, 0.42, 0.42),
+        "green":      (0.48, 0.83, 0.48),
+        "lavender":   (0.79, 0.65, 1.00),
+        "teal":       (0.45, 0.88, 0.82),
+        "earth":      (0.79, 0.69, 0.53)
+    }
+    return table.get(glow, (0.81, 0.88, 1.00))
+
+def shape_mesh(side):
+    # diamond for paternal, circle (disc) for maternal
+    # We’ll use a flat disc and rotate a square for diamond
+    if side == "paternal":
+        bpy.ops.mesh.primitive_plane_add(size=STAR_SIZE)
+        obj = bpy.context.active_object
+        obj.rotation_euler.z = math.radians(45)  # diamond
+        return obj
+    else:
+        bpy.ops.mesh.primitive_circle_add(vertices=24, radius=STAR_SIZE*0.8, fill_type='NGON')
+        return bpy.context.active_object
+
+def place_star(person, angle_idx, total):
+    # If pos is provided (x,y), use it. Else, put on a circle.
+    pos = person.get("pos", None)
+    if pos and isinstance(pos.get("x"), (int,float)) and isinstance(pos.get("y"), (int,float)):
+        x, y = pos["x"], pos["y"]
+    else:
+        angle = 2*math.pi * (angle_idx / max(total, 1))
+        x = math.cos(angle) * LAYOUT_RADIUS
+        y = math.sin(angle) * LAYOUT_RADIUS
+    obj = shape_mesh(person.get("side","maternal"))
+    obj.name = f"STAR_{person['id']}"
+    obj.location = (x, y, 0.0)
+    # material
+    col = color_from_glow(person.get("glow",""))
+    mat = get_or_create_emission_material(f"EMIT_{person['glow']}", col)
+    if obj.data.materials:
+        obj.data.materials[0] = mat
+    else:
+        obj.data.materials.append(mat)
+    obj.hide_render = True  # start hidden until reveal
+    return obj
+
+def bezier_curve_between(a_loc, b_loc):
+    # simple arc using a midpoint lifted in Z
+    p0 = mathutils.Vector(a_loc)
+    p1 = mathutils.Vector(b_loc)
+    mid = (p0 + p1) / 2
+    ctrl = mathutils.Vector((mid.x, mid.y, 1.2))  # lift for arc
+    curve_data = bpy.data.curves.new('edgeCurve', type='CURVE')
+    curve_data.dimensions = '3D'
+    spline = curve_data.splines.new('BEZIER')
+    spline.bezier_points.add(2)
+    pts = spline.bezier_points
+    pts[0].co = p0; pts[0].handle_left = p0; pts[0].handle_right = ctrl
+    pts[1].co = ctrl; pts[1].handle_left = ctrl; pts[1].handle_right = ctrl
+    pts[2].co = p1; pts[2].handle_left = ctrl; pts[2].handle_right = p1
+    curve_obj = bpy.data.objects.new('EDGE', curve_data)
+    bpy.context.scene.collection.objects.link(curve_obj)
+    # thickness via bevel
+    curve_data.bevel_depth = EDGE_WIDTH
+    return curve_obj
+
+def set_visibility_keyframes(obj, frame_on):
+    # hidden before, visible after frame_on
+    obj.hide_render = True
+    obj.keyframe_insert(data_path="hide_render", frame=frame_on-1)
+    obj.hide_render = False
+    obj.keyframe_insert(data_path="hide_render", frame=frame_on)
+
+def animate_camera_focus(cam_obj, target_loc, frame, zoom=1.4):
+    # Damp track to empty target; animate location and FOV
+    scene = bpy.context.scene
+    # create/ensure target empty
+    tgt_name = "CamTarget"
+    tgt = bpy.data.objects.get(tgt_name)
+    if not tgt:
+        tgt = bpy.data.objects.new(tgt_name, None)
+        bpy.context.scene.collection.objects.link(tgt)
+    tgt.location = target_loc
+    tgt.keyframe_insert(data_path="location", frame=frame)
+
+    # add track constraint once
+    if not any(c.type == 'TRACK_TO' for c in cam_obj.constraints):
+        con = cam_obj.constraints.new(type='TRACK_TO')
+        con.target = tgt
+        con.track_axis = 'TRACK_NEGATIVE_Z'
+        con.up_axis = 'UP_Y'
+
+    # animate camera distance (move on -Z) and lens as "zoom"
+    cam_obj.location = (target_loc[0], target_loc[1]-3.0/zoom, 2.5/zoom)
+    cam_obj.keyframe_insert(data_path="location", frame=frame)
+    cam = cam_obj.data
+    cam.lens = 50/zoom
+    cam.keyframe_insert(data_path="lens", frame=frame)
+
+# ========= MAIN =========
+# Clean default scene
+bpy.ops.object.select_all(action='SELECT')
+bpy.ops.object.delete(use_global=False)
+ensure_eevee_with_bloom()
+
+# Camera & light
+bpy.ops.object.camera_add(location=(0, -7, 3), rotation=(math.radians(75), 0, 0))
+cam = bpy.context.active_object
+bpy.context.scene.camera = cam
+bpy.ops.object.light_add(type='AREA', location=(0,0,5))
+bpy.context.active_object.data.energy = 200
+
+# Background (world color)
+world = bpy.context.scene.world
+world.use_nodes = True
+bg = world.node_tree.nodes['Background']
+bg.inputs[0].default_value = (0.03, 0.05, 0.12, 1)  # deep navy
+
+# Collections
+col_stars = new_collection("Stars")
+col_edges = new_collection("Edges")
+
+# Load JSON
+with open(JSON_PATH, "r", encoding="utf-8") as f:
+    data = json.load(f)
+
+people = data["people"]
+rels = data.get("relationships", [])
+timeline = data.get("timeline", [])
+
+# Index people
+people_by_id = {p["id"]: p for p in people}
+
+# Create stars
+stars = {}
+for idx, p in enumerate(people):
+    star = place_star(p, idx, len(people))
+    # move to Stars collection
+    for coll in star.users_collection:
+        coll.objects.unlink(star)
+    col_stars.objects.link(star)
+    stars[p["id"]] = star
+
+# Pre-create edges (hidden), one per relationship
+edge_objs = []
+for r in rels:
+    a = stars.get(r["parent_id"])
+    b = stars.get(r["child_id"])
+    if not (a and b): continue
+    curve = bezier_curve_between(a.location, b.location)
+    # color curve using emission material
+    col = (0.64, 0.71, 1.0)  # soft blue
+    mat = get_or_create_emission_material("EMIT_EDGE", col)
+    if len(curve.data.materials):
+        curve.data.materials[0] = mat
+    else:
+        curve.data.materials.append(mat)
+    curve.hide_render = True
+    # move to Edges collection
+    for coll in curve.users_collection:
+        coll.objects.unlink(curve)
+    col_edges.objects.link(curve)
+    # store mapping
+    curve.name = f"EDGE_{r['parent_id']}_{r['child_id']}"
+    edge_objs.append((r, curve))
+
+# Animate by timeline
+for evt in timeline:
+    t = evt.get("t", 0.0)
+    frame = sec_to_frame(t)
+    action = evt.get("action")
+
+    if action == "reveal_node":
+        pid = evt["id"]
+        obj = stars.get(pid)
+        if obj:
+            set_visibility_keyframes(obj, frame)
+
+    elif action == "draw_edge":
+        a, b = evt["from"], evt["to"]
+        name = f"EDGE_{a}_{b}"
+        obj = bpy.data.objects.get(name)
+        if obj:
+            set_visibility_keyframes(obj, frame)
+
+    elif action == "focus_node":
+        pid = evt["id"]
+        zoom = evt.get("zoom", 1.4)
+        obj = stars.get(pid)
+        if obj:
+            animate_camera_focus(cam, obj.location, frame, zoom)
+
+    elif action == "zoom_out":
+        # pull the camera back to show everything
+        animate_camera_focus(cam, mathutils.Vector((0,0,0)), frame, evt.get("zoom", 0.9))
+
+# Scene range & output
+scene = bpy.context.scene
+scene.frame_start = 0
+scene.frame_end = sec_to_frame(SCENE_DURATION_SECONDS)
+scene.render.resolution_x = 1920
+scene.render.resolution_y = 1080
+scene.render.film_transparent = False
+
+# Output path (change if desired)
+out_dir = bpy.path.abspath("//renders")
+os.makedirs(out_dir, exist_ok=True)
+scene.render.filepath = os.path.join(out_dir, "constellation_")
+scene.render.image_settings.file_format = 'FFMPEG'
+scene.render.ffmpeg.format = 'MPEG4'
+scene.render.ffmpeg.codec = 'H264'
+scene.render.ffmpeg.constant_rate_factor = 'MEDIUM'
+scene.render.ffmpeg.max_b_frames = 2
+scene.render.ffmpeg.gopsize = 12
+
+print("Setup complete. Use Render > Render Animation to export video.")
